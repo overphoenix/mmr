@@ -1,7 +1,10 @@
 package matrix
 
 import (
+	"crypto/ed25519"
 	"errors"
+	"fmt"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -11,6 +14,7 @@ import (
 
 var ErrInvalidToken = errors.New("missing or invalid access token")
 var ErrGuestToken = errors.New("token belongs to a guest")
+var ErrNoXMatrixAuth = errors.New("no X-Matrix auth headers")
 
 func doBreakerRequest(ctx rcontext.RequestContext, serverName string, accessToken string, appserviceUserId string, ipAddr string, method string, path string, resp interface{}) error {
 	if accessToken == "" {
@@ -76,4 +80,58 @@ func LogoutAll(ctx rcontext.RequestContext, serverName string, accessToken strin
 		return err
 	}
 	return nil
+}
+
+func ValidateXMatrixAuth(request *http.Request, expectNoContent bool) (string, error) {
+	if !expectNoContent {
+		panic("development error: X-Matrix auth validation can only be done with an empty body for now")
+	}
+
+	auths, err := util.GetXMatrixAuth(request)
+	if err != nil {
+		return "", err
+	}
+
+	if len(auths) == 0 {
+		return "", ErrNoXMatrixAuth
+	}
+
+	obj := map[string]interface{}{
+		"method":      request.Method,
+		"uri":         request.RequestURI,
+		"origin":      auths[0].Origin,
+		"destination": auths[0].Destination,
+		"content":     "{}",
+	}
+	canonical, err := util.EncodeCanonicalJson(obj)
+	if err != nil {
+		return "", err
+	}
+
+	keys, err := QuerySigningKeys(auths[0].Origin)
+	if err != nil {
+		return "", err
+	}
+
+	for _, h := range auths {
+		if h.Origin != obj["origin"] {
+			return "", errors.New("auth is from multiple servers")
+		}
+		if h.Destination != obj["destination"] {
+			return "", errors.New("auth is for multiple servers")
+		}
+		if h.Destination != "" && !util.IsServerOurs(h.Destination) {
+			return "", errors.New("unknown destination")
+		}
+
+		if key, ok := (*keys)[h.KeyId]; ok {
+			if !ed25519.Verify(key, canonical, h.Signature) {
+				return "", fmt.Errorf("failed signatures on '%s'", h.KeyId)
+			}
+		} else {
+			return "", fmt.Errorf("unknown key '%s'", h.KeyId)
+		}
+	}
+
+	return auths[0].Origin, nil
 }
